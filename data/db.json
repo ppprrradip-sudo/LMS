@@ -6,7 +6,8 @@
       "username": "siswa",
       "password": "123456",
       "role": "siswa",
-      "className": "IX-A"
+      "className": "XI-RPL",
+      "major": "RPL"
     },
     {
       "id": "u2",
@@ -14,7 +15,9 @@
       "username": "guru",
       "password": "123456",
       "role": "guru",
-      "subject": "Matematika"
+      "className": "XI-RPL",
+      "major": "RPL",
+      "subject": "Pemrograman"
     },
     {
       "id": "u3",
@@ -43,7 +46,8 @@
       "username": "raka",
       "password": "123456",
       "role": "siswa",
-      "className": "IX-A"
+      "className": "XI-RPL",
+      "major": "RPL"
     },
     {
       "id": "u7",
@@ -51,10 +55,25 @@
       "username": "maya",
       "password": "123456",
       "role": "siswa",
-      "className": "VIII-B"
+      "className": "XI-TKJ",
+      "major": "TKJ"
     }
   ],
-  "tasks": [],
+  "tasks": [
+    {
+      "id": "t1790184195945",
+      "title": "awdwda",
+      "subject": "HARD WARE",
+      "className": "XI-TKJ",
+      "major": "TKJ",
+      "description": "awdadjwiaj",
+      "dueDate": "2026-09-25",
+      "imageData": "",
+      "teacherId": "u2",
+      "teacherName": "Budi Santoso",
+      "createdAt": "2026-09-23"
+    }
+  ],
   "exams": [],
   "submissions": []
 }
