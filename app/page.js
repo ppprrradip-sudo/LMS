@@ -1,0 +1,319 @@
+"use client";
+
+import { useEffect, useMemo, useState } from "react";
+import { supabase } from "@/utils/supabase/client";
+
+const roleLabels = { siswa: "Siswa", guru: "Guru", admin: "Admin", kepsek: "Kepala Sekolah", kurikulum: "Kurikulum" };
+const today = new Intl.DateTimeFormat("id-ID", { dateStyle: "full" }).format(new Date());
+
+function authEmail(username) {
+  return username.includes("@") ? username : `${username}@mls.invalid`;
+}
+
+async function request(url, options) {
+  const response = await fetch(url, { headers: { "Content-Type": "application/json" }, ...options });
+  const body = await response.text();
+  let data = {};
+  try { data = body ? JSON.parse(body) : {}; } catch {}
+  if (!response.ok) throw new Error(data.message || `Permintaan gagal (HTTP ${response.status}).`);
+  if (!body) throw new Error("Server mengembalikan respons kosong.");
+  return data;
+}
+
+export default function Home() {
+  const [user, setUser] = useState(null);
+  const [db, setDb] = useState({ users: [], tasks: [], exams: [], submissions: [] });
+  const [login, setLogin] = useState({ username: "", password: "" });
+  const [error, setError] = useState("");
+  const [view, setView] = useState("ringkasan");
+  const [activeExam, setActiveExam] = useState(null);
+  const [notice, setNotice] = useState("");
+
+  async function refresh() {
+    const profileTable = user?.role === "admin" ? "users" : "user_directory";
+    const [data, usersResult] = await Promise.all([
+      request("/api/data"),
+      supabase.from(profileTable).select("*")
+    ]);
+    if (usersResult.error) throw usersResult.error;
+    setDb({ ...data, users: usersResult.data || [] });
+  }
+  useEffect(() => { if (user) refresh().catch((err) => setError(`Gagal memuat data: ${err.message}`)); }, [user]);
+
+  async function signIn(event) {
+    event.preventDefault(); setError("");
+    try {
+      const { data, error } = await supabase.auth.signInWithPassword({ email: authEmail(login.username.trim()), password: login.password });
+      if (error) throw error;
+      const { data: profile, error: profileError } = await supabase.from("users").select("*").eq("id", data.user.id).single();
+      if (profileError) {
+        await supabase.auth.signOut();
+        throw new Error("Profil akun tidak ditemukan di database.");
+      }
+      setUser(profile); setView("ringkasan");
+    }
+    catch (err) { setError(err.message); }
+  }
+  async function signOut() { await supabase.auth.signOut(); setUser(null); setDb({ users: [], tasks: [], exams: [], submissions: [] }); }
+  async function mutate(url, body, method = "POST") {
+    try {
+      setError("");
+      if (url === "/api/users" && method === "POST") {
+        const { data: sessionData, error: sessionError } = await supabase.auth.getSession();
+        if (sessionError) throw sessionError;
+        const previousSession = sessionData.session;
+        const { password, ...profileFields } = body;
+        const email = authEmail(body.username.trim());
+        const { data, error } = await supabase.auth.signUp({
+          email,
+          password,
+          options: { data: profileFields }
+        });
+        if (error) throw error;
+        if (!data.user || !data.session) throw new Error("Pendaftaran belum aktif. Matikan konfirmasi email di pengaturan Supabase Auth.");
+        const { error: insertError } = await supabase.from("users").insert({ ...profileFields, id: data.user.id, email });
+        if (previousSession) {
+          const { error: restoreError } = await supabase.auth.setSession({ access_token: previousSession.access_token, refresh_token: previousSession.refresh_token });
+          if (restoreError) throw restoreError;
+        }
+        if (insertError) throw insertError;
+      } else if (url.startsWith("/api/users?id=") && method === "DELETE") {
+        const id = new URL(url, window.location.origin).searchParams.get("id");
+        const { data, error } = await supabase.from("users").delete().eq("id", id).select("id");
+        if (error) throw error;
+        if (!data?.length) throw new Error("Pengguna tidak ditemukan atau izin penghapusan ditolak.");
+      } else {
+        await request(url, { method, body: body ? JSON.stringify(body) : undefined });
+      }
+      await refresh();
+      setNotice("Perubahan berhasil disimpan.");
+    } catch (err) { setError(`Gagal menyimpan perubahan: ${err.message}`); }
+  }
+
+  if (!user) return <Login login={login} setLogin={setLogin} signIn={signIn} error={error} />;
+  const navItems = user.role === "guru" ? ["ringkasan", "aktivitas-guru", "buat-tugas", "buat-ujian"] : user.role === "admin" ? ["ringkasan", "kelola-user"] : ["ringkasan"];
+  if (user.role === "siswa") navItems.push("belajar");
+  if (["kepsek", "kurikulum"].includes(user.role)) navItems.push("statistik");
+
+  return <div className="app-grid">
+    <aside className="sidebar">
+      <div className="brand-mark">MLS / sekolah</div>
+      <h3>{user.name}</h3><div className="role">{roleLabels[user.role]}</div>
+      <nav className="nav">{navItems.map((item) => <button key={item} className={view === item ? "active" : ""} onClick={() => { setView(item); setNotice(""); }}>{viewLabel(item)}</button>)}</nav>
+      <button className="logout" onClick={signOut}>Keluar dari akun</button>
+    </aside>
+    <main className="main">
+      {notice && <div className="tag" style={{ marginBottom: 18 }}>{notice}</div>}
+      {error && <div className="error">{error}</div>}
+      <div className="topline"><div><div className="eyebrow">Ruang belajar digital</div><h1>{heading(view, user.role)}</h1><p className="subtle">Selamat datang kembali, {user.name.split(" ")[0]}.</p></div><div className="date">{today}</div></div>
+      {view === "ringkasan" && <Overview user={user} db={db} setView={setView} />}
+      {view === "belajar" && <StudentWork user={user} db={db} setView={setView} setActiveExam={setActiveExam} mutate={mutate} />}
+      {view === "kerjakan-ujian" && <ExamPage user={user} exam={activeExam} setView={setView} mutate={mutate} />}
+      {view === "aktivitas-guru" && <TeacherActivities user={user} db={db} mutate={mutate} />}
+      {view === "buat-tugas" && <TaskBuilder user={user} mutate={mutate} />}
+      {view === "buat-ujian" && <ExamBuilder user={user} mutate={mutate} />}
+      {view === "kelola-user" && <UserManager db={db} mutate={mutate} />}
+      {view === "statistik" && <Statistics db={db} user={user} />}
+    </main>
+  </div>;
+}
+
+function Login({ login, setLogin, signIn, error }) { return <div className="login-page"><section className="login-art"><div className="brand-mark">MLS / sekolah</div><h1>Belajar, bertumbuh, berdampak.</h1><p>Satu ruang sederhana untuk tugas, ujian, dan keputusan sekolah yang lebih terarah.</p></section><section className="login-panel"><form className="login-box" onSubmit={signIn}><div className="eyebrow">Masuk ke MLS</div><h2>Selamat datang.</h2><p className="subtle">Gunakan akun sekolahmu untuk melanjutkan.</p><div className="field"><label>USERNAME</label><input value={login.username} onChange={(e) => setLogin({ ...login, username: e.target.value })} /></div><div className="field"><label>PASSWORD</label><input type="password" value={login.password} onChange={(e) => setLogin({ ...login, password: e.target.value })} /></div>{error && <div className="error">{error}</div>}<button className="primary" type="submit">Masuk ke dashboard</button></form></section></div>; }
+
+function Overview({ user, db, setView }) { const isStudent = user.role === "siswa"; const ownSubmissions = db.submissions.filter((item) => item.userId === user.id); const students = db.users.filter((item) => item.role === "siswa").length; const eligibleTasks = isStudent ? db.tasks.filter((task) => matchesStudentGroup(task, user)) : db.tasks; const eligibleExams = isStudent ? db.exams.filter((exam) => matchesStudentGroup(exam, user)) : db.exams; return <><div className="stats"><Stat value={isStudent ? eligibleTasks.length : db.users.length} label={isStudent ? "Tugas tersedia" : "Total pengguna"} /><Stat value={isStudent ? eligibleExams.length : db.tasks.length} label={isStudent ? "Ujian aktif" : "Tugas dibuat"} /><Stat value={isStudent ? ownSubmissions.length : db.exams.length} label={isStudent ? "Sudah dikumpulkan" : "Ujian aktif"} /><Stat value={students} label="Siswa terdaftar" /></div><div className="section-grid"><section className="panel"><div className="panel-header"><h3>{isStudent ? "Aktivitas terbaru" : "Ringkasan aktivitas"}</h3>{isStudent && <button className="secondary" onClick={() => setView("belajar")}>Buka ruang belajar</button>}</div>{eligibleTasks.slice(0, 3).map((task) => <Activity key={task.id} title={task.title} meta={`${task.subject || task.major || "Mapel"} · ${task.className || "Semua kelas"} · tenggat ${task.dueDate}`} tag="Tugas" />)}{eligibleExams.slice(0, 2).map((exam) => <Activity key={exam.id} title={exam.title} meta={`${exam.subject || exam.major || "Mapel"} · ${exam.className || "Semua kelas"} · ${exam.questions.length} soal`} tag="Ujian" />)}</section><section className="panel"><div className="panel-header"><h3>Catatan</h3></div><p className="subtle">{isStudent ? "Kerjakan tugas sebelum tenggat dan cek kembali jawabanmu sebelum dikumpulkan." : user.role === "guru" ? "Buat materi yang jelas dan pantau progres kelas dari satu tempat." : "Gunakan data aktivitas untuk menjaga ritme belajar sekolah."}</p></section></div></>; }
+function Activity({ title, meta, tag }) { return <div className="item"><div><h4>{title}</h4><p>{meta}</p></div><span className="tag">{tag}</span></div>; }
+function Stat({ value, label }) { return <div className="stat"><span>{label}</span><strong>{value}</strong></div>; }
+function viewLabel(view) { return ({ ringkasan: "Ringkasan", belajar: "Ruang belajar", "aktivitas-guru": "Aktivitas saya", "buat-tugas": "Buat tugas", "buat-ujian": "Buat ujian", "kelola-user": "Kelola pengguna", statistik: "Statistik sekolah" })[view]; }
+function heading(view, role) { if (view === "belajar") return "Ruang belajar"; if (view === "kerjakan-ujian") return "Kerjakan ujian"; if (view === "aktivitas-guru") return "Aktivitas saya"; if (view === "buat-tugas") return "Tugas baru"; if (view === "buat-ujian") return "Susun ujian"; if (view === "kelola-user") return "Pengguna sekolah"; if (view === "statistik") return "Sekolah dalam angka"; return role === "siswa" ? "Halo, siswa." : "Pusat kendali."; }
+
+function StudentWork({ user, db, setView, setActiveExam, mutate }) { const tasks = db.tasks.filter((task) => matchesStudentGroup(task, user)); const exams = db.exams.filter((exam) => matchesStudentGroup(exam, user)); const completed = (id) => db.submissions.some((item) => item.userId === user.id && item.activityId === id && (item.type !== "task" || item.answerPhoto)); return <div className="section-grid"><section className="panel"><div className="panel-header"><h3>Tugasmu</h3><small>{tasks.length} tersedia</small></div>{tasks.length === 0 && <p className="empty">Belum ada tugas untuk kelas dan jurusanmu.</p>}{tasks.map((task) => { const submission = db.submissions.find((item) => item.userId === user.id && item.activityId === task.id && item.type === "task"); return <div className="item task-item" key={task.id}><div className="task-content"><h4>{task.title}</h4>{task.description && <p>{task.description}</p>}<p>{task.subject || task.major || "Mapel"} · {task.className || "Semua kelas"} · tenggat {task.dueDate}</p>{task.imageData && <div className="task-image-wrap"><img className="task-image" src={task.imageData} alt={`Foto tugas ${task.title}`} /></div>}{submission?.score != null && <p className="score-text">Nilai: <strong>{submission.score}</strong></p>}</div><TaskSubmission task={task} user={user} completed={completed(task.id)} mutate={mutate} submission={submission} /></div>; })}</section><section className="panel"><div className="panel-header"><h3>Ujian aktif</h3></div>{exams.length === 0 && <p className="empty">Belum ada ujian untuk kelas dan jurusanmu.</p>}{exams.map((exam) => <div className="item" key={exam.id}><div><h4>{exam.title}</h4><p>{exam.subject || exam.major || "Mapel"} · {exam.className || "Semua kelas"} · {exam.duration} menit · {exam.questions.length} soal · KKM {Number(exam.kkm ?? 75)}</p></div><button className="primary" onClick={() => { setActiveExam(exam); setView("kerjakan-ujian"); }}>Mulai ujian</button></div>)}</section></div>; }
+function TaskSubmission({ task, user, completed, mutate, submission }) { const [photo, setPhoto] = useState(""); const [fileName, setFileName] = useState(""); const [processing, setProcessing] = useState(false); const [keterangan, setKeterangan] = useState(""); function choosePhoto(event) { const file = event.target.files?.[0]; if (!file) return; setFileName(file.name); setProcessing(true); compressImage(file).then(setPhoto).catch(() => setFileName("Foto tidak dapat dibaca")).finally(() => setProcessing(false)); } return completed ? <div className="task-submit"><button className="secondary" disabled>Terkumpul</button>{submission?.score != null && <div className="score-pill">Nilai: {submission.score}</div>}</div> : <div className="task-submit"><textarea rows="3" value={keterangan} onChange={(e) => setKeterangan(e.target.value)} placeholder="Tulis keterangan tambahan..." aria-label={`Keterangan ${task.title}`} /><input type="file" accept="image/*" onChange={choosePhoto} aria-label={`Foto jawaban ${task.title}`} /><small>{processing ? "Menyiapkan foto..." : fileName || "Pilih foto jawaban"}</small><button className="primary" disabled={!photo || processing || !mutate} onClick={() => mutate?.("/api/submissions", { userId: user.id, activityId: task.id, type: "task", answer: "Foto halaman jawaban", answerPhoto: photo, keterangan: keterangan.trim() })}>Kirim foto</button></div>; }
+function compressImage(file) { return new Promise((resolve, reject) => { const reader = new FileReader(); reader.onerror = reject; reader.onload = () => { const image = new Image(); image.onerror = reject; image.onload = () => { const scale = Math.min(1, 1200 / Math.max(image.width, image.height)); const canvas = document.createElement("canvas"); canvas.width = Math.max(1, Math.round(image.width * scale)); canvas.height = Math.max(1, Math.round(image.height * scale)); canvas.getContext("2d").drawImage(image, 0, 0, canvas.width, canvas.height); resolve(canvas.toDataURL("image/jpeg", 0.6)); }; image.src = reader.result; }; reader.readAsDataURL(file); }); }
+function TeacherActivities({ user, db, mutate }) { const tasks = db.tasks.filter((task) => task.teacherId === user.id); const exams = db.exams.filter((exam) => exam.teacherId === user.id); const remove = (url, title) => { if (window.confirm(`Hapus ${title}? Aktivitas ini tidak bisa dikembalikan.`)) mutate(url, null, "DELETE"); }; return <div className="section-grid"><section className="panel"><div className="panel-header"><h3>Tugas yang sedang berlangsung</h3><small>{tasks.length} tugas</small></div>{tasks.length === 0 && <p className="empty">Belum ada tugas yang dibuat.</p>}{tasks.map((task) => <div className="activity-block" key={task.id}><div className="item"><div><h4>{task.title}</h4><p>{task.subject} · tenggat {task.dueDate}</p><p>{task.description || "Tugas dengan lampiran soal."}</p></div><button className="danger" onClick={() => remove(`/api/tasks?id=${task.id}`, "tugas ini")}>Hapus</button></div><TeacherTaskSubmissions task={task} db={db} mutate={mutate} /></div>)}</section><section className="panel"><div className="panel-header"><h3>Ujian yang sedang berlangsung</h3><small>{exams.length} ujian</small></div>{exams.length === 0 && <p className="empty">Belum ada ujian yang dibuat.</p>}{exams.map((exam) => <div className="activity-block" key={exam.id}><div className="item"><div><h4>{exam.title}</h4><p>{exam.subject} · {exam.duration} menit · {exam.questions.length} soal · KKM {Number(exam.kkm ?? 75)}</p></div><button className="danger" onClick={() => remove(`/api/exams?id=${exam.id}`, "ujian ini")}>Hapus</button></div><ExamKkmEditor exam={exam} mutate={mutate} /><TeacherExamResults exam={exam} db={db} /></div>)}</section></div>; }
+function ExamKkmEditor({ exam, mutate }) { const [kkm, setKkm] = useState(Number(exam?.kkm ?? 75)); useEffect(() => { setKkm(Number(exam?.kkm ?? 75)); }, [exam?.kkm, exam?.id]); async function saveKkm() { const safeKkm = Math.min(100, Math.max(0, Number(kkm) || 0)); await mutate(`/api/exams?id=${exam.id}`, { ...exam, kkm: safeKkm }, "PUT"); } return <div className="result"><div><b>KKM ujian</b></div><div className="task-submit"><input type="number" min="0" max="100" value={kkm} onChange={(e) => setKkm(e.target.value)} /><button className="secondary" onClick={saveKkm}>Simpan KKM</button></div></div>; }
+function TeacherTaskSubmissions({ task, db, mutate }) { const submissions = useMemo(() => db.submissions.filter((submission) => submission.activityId === task.id && submission.type === "task"), [db.submissions, task.id]); const [scoreDrafts, setScoreDrafts] = useState({}); useEffect(() => { setScoreDrafts((current) => { const next = {}; submissions.forEach((submission) => { next[submission.id] = current[submission.id] ?? submission.score ?? ""; }); return next; }); }, [submissions]); async function saveScore(submission) { const numericValue = Number(scoreDrafts[submission.id] ?? submission.score ?? ""); if (!Number.isFinite(numericValue)) return; const safeScore = Math.min(100, Math.max(0, numericValue)); await mutate(`/api/submissions?id=${submission.id}`, { ...submission, score: safeScore }, "PUT"); } return <div className="results"><strong>Jawaban siswa ({submissions.length})</strong>{submissions.length === 0 && <p className="empty">Belum ada jawaban yang masuk.</p>}{submissions.map((submission) => <div className="result" key={submission.id}><div><b>{studentName(db, submission.userId)}</b><small>{formatDate(submission.submittedAt)}</small>{submission.keterangan && <p className="submission-note">Keterangan: {submission.keterangan}</p>}{submission.score != null && <span className="tag score-tag">Nilai {submission.score}</span>}</div>{submission.answerPhoto ? <details><summary>Lihat foto jawaban</summary><img className="answer-photo" src={submission.answerPhoto} alt={`Jawaban ${studentName(db, submission.userId)}`} /></details> : <span className="tag">Foto tidak tersedia</span>}<div className="grade-box"><label>Nilai tugas</label><input type="number" min="0" max="100" value={scoreDrafts[submission.id] ?? ""} onChange={(e) => setScoreDrafts((current) => ({ ...current, [submission.id]: e.target.value }))} /><button className="secondary" onClick={() => saveScore(submission)}>Simpan nilai</button></div></div>)}</div>; }
+function TeacherExamResults({ exam, db }) { const submissions = db.submissions.filter((submission) => submission.activityId === exam.id && submission.type === "exam"); return <div className="results"><strong>Hasil siswa ({submissions.length})</strong>{submissions.length === 0 && <p className="empty">Belum ada siswa yang mengumpulkan.</p>}{submissions.map((submission) => { const correct = exam.questions.filter((question) => submission.answer?.[question.id] === question.answer).length; const percentage = Math.round((correct / Math.max(exam.questions.length, 1)) * 100); return <div className="result" key={submission.id}><div><b>{studentName(db, submission.userId)}</b><small>{formatDate(submission.submittedAt)}</small></div><span className="tag">{correct}/{exam.questions.length} benar · {percentage}%</span></div>; })}</div>; }
+function studentName(db, userId) { return db.users.find((student) => student.id === userId)?.name || "Siswa tidak ditemukan"; }
+function matchesStudentGroup(item, user) { const itemClass = item.className || ""; const itemMajor = item.major || ""; const userClass = user.className || ""; const userMajor = user.major || ""; const classMatches = !itemClass || itemClass === userClass; const majorMatches = !itemMajor || itemMajor === userMajor; return classMatches && majorMatches; }
+function formatDate(value) { return value ? new Intl.DateTimeFormat("id-ID", { dateStyle: "short", timeStyle: "short" }).format(new Date(value)) : ""; }
+function ExamPage({ user, exam, setView, mutate }) { const [answers, setAnswers] = useState({}); if (!exam) return <section className="panel"><p className="empty">Ujian tidak ditemukan.</p><button className="secondary" onClick={() => setView("belajar")}>Kembali ke ruang belajar</button></section>; async function submit() { await mutate("/api/submissions", { userId: user.id, activityId: exam.id, type: "exam", answer: answers }); setView("belajar"); } return <section className="panel"><div className="panel-header"><div><div className="eyebrow">Mode mengerjakan</div><h3>{exam.title}</h3><small>{exam.subject} · {exam.duration} menit · {exam.questions.length} soal · KKM {Number(exam.kkm ?? 75)}</small></div><button className="secondary" onClick={() => setView("belajar")}>Kembali</button></div>{exam.questions.map((question, index) => <div className="question" key={question.id}><strong>SOAL {index + 1}</strong><p>{question.text}</p><select value={answers[question.id] || ""} onChange={(e) => setAnswers({ ...answers, [question.id]: e.target.value })}><option value="">Pilih jawaban</option>{question.options.map((option) => <option key={option}>{option}</option>)}</select></div>)}<button className="primary" onClick={submit}>Kumpulkan ujian</button></section>; }
+
+/*
+function TaskBuilder({ user, mutate }) { const [form, setForm] = useState({ title: "", subject: user.subject || user.major || "", className: user.className || "", major: user.major || user.subject || "", description: "", dueDate: "", imageData: "" }); const update = (key, value) => setForm({ ...form, [key]: value }); async function submit(e) { e.preventDefault(); await mutate("/api/tasks", { ...form, teacherId: user.id, teacherName: user.name, subject: form.subject || form.major || user.subject || user.major || "", className: form.className || user.className || "", major: form.major || user.major || user.subject || "" }); setForm({ title: "", subject: user.subject || user.major || "", className: user.className || "", major: user.major || user.subject || "", description: "", dueDate: "", imageData: "" }); } return <section className="panel"><div className="panel-header"><h3>Terbitkan tugas untuk kelas</h3><small>Teks atau foto soal</small></div><form onSubmit={submit}><div className="form-grid"><Field label="JUDUL TUGAS" value={form.title} onChange={(e) => update("title", e.target.value)} required /><Field label="MATA PELAJARAN" value={form.subject} onChange={(e) => update("subject", e.target.value)} required /><Field label="KELAS" value={form.className} onChange={(e) => update("className", e.target.value)} placeholder="Contoh: XI RPL" /><Field label="JURUSAN" value={form.major} onChange={(e) => update("major", e.target.value)} placeholder="Contoh: RPL / TKJ / IPS" /><Field label="TENGGAT" type="date" value={form.dueDate} onChange={(e) => update("dueDate", e.target.value)} required /><div className="field wide"><label>INSTRUKSI / SOAL</label><textarea rows="5" value={form.description} onChange={(e) => update("description", e.target.value)} placeholder="Ketik instruksi atau soal di sini..." /></div><div className="field wide"><label>FOTO SOAL (OPSIONAL)</label><input type="file" accept="image/*" onChange={(e) => { const file = e.target.files?.[0]; if (!file) return; const reader = new FileReader(); reader.onload = () => update("imageData", reader.result); reader.readAsDataURL(file); }} /></div></div><button className="primary" type="submit">Terbitkan tugas</button></form></section>; }
+*/
+
+function TaskBuilder({ user, mutate }) {
+  const [form, setForm] = useState({
+    title: "",
+    subject: user.subject || user.major || "",
+    className: user.className || "",
+    major: user.major || user.subject || "",
+    description: "",
+    dueDate: "",
+    imageData: "",
+  });
+
+  const update = (key, value) => setForm({ ...form, [key]: value });
+
+  async function submit(e) {
+    e.preventDefault();
+    await mutate("/api/tasks", {
+      ...form,
+      teacherId: user.id,
+      teacherName: user.name,
+      subject: form.subject || form.major || user.subject || user.major || "",
+      className: form.className || user.className || "",
+      major: form.major || user.major || user.subject || "",
+    });
+    setForm({
+      title: "",
+      subject: user.subject || user.major || "",
+      className: user.className || "",
+      major: user.major || user.subject || "",
+      description: "",
+      dueDate: "",
+      imageData: "",
+    });
+  }
+
+  return (
+    <section className="panel">
+      <div className="panel-header">
+        <h3>Terbitkan tugas untuk kelas</h3>
+        <small>Teks atau foto soal</small>
+      </div>
+      <form onSubmit={submit}>
+        <div className="form-grid">
+          <Field label="JUDUL TUGAS" value={form.title} onChange={(e) => update("title", e.target.value)} required />
+          <Field label="MATA PELAJARAN" value={form.subject} onChange={(e) => update("subject", e.target.value)} required />
+          <Field label="KELAS" value={form.className} onChange={(e) => update("className", e.target.value)} placeholder="Contoh: XI RPL" />
+          <Field label="JURUSAN" value={form.major} onChange={(e) => update("major", e.target.value)} placeholder="Contoh: RPL / TKJ / IPS" />
+          <Field label="TENGGAT" type="date" value={form.dueDate} onChange={(e) => update("dueDate", e.target.value)} required />
+          <div className="field wide">
+            <label>INSTRUKSI / SOAL</label>
+            <textarea rows="5" value={form.description} onChange={(e) => update("description", e.target.value)} placeholder="Ketik instruksi atau soal di sini..." />
+          </div>
+          <div className="field wide">
+            <label>FOTO SOAL (OPSIONAL)</label>
+            <input
+              type="file"
+              accept="image/*"
+              onChange={(e) => {
+                const file = e.target.files?.[0];
+                if (!file) return;
+                const reader = new FileReader();
+                reader.onload = () => update("imageData", reader.result);
+                reader.readAsDataURL(file);
+              }}
+            />
+          </div>
+        </div>
+        <button className="primary" type="submit">Terbitkan tugas</button>
+      </form>
+    </section>
+  );
+}
+
+function Field({ label, ...props }) {
+  return (
+    <div className="field">
+      <label>{label}</label>
+      <input {...props} />
+    </div>
+  );
+}
+
+function ExamBuilder({ user, mutate }) {
+  const [form, setForm] = useState({
+    title: "",
+    subject: user.subject || "",
+    duration: 45,
+    kkm: 75,
+  });
+  const [questions, setQuestions] = useState([{ text: "", options: ["", "", "", ""], answer: "" }]);
+
+  function updateQuestion(index, key, value) {
+    setQuestions(questions.map((q, i) => (i === index ? { ...q, [key]: value } : q)));
+  }
+
+  function updateOption(qIndex, optionIndex, value) {
+    setQuestions(
+      questions.map((q, i) =>
+        i === qIndex
+          ? { ...q, options: q.options.map((option, j) => (j === optionIndex ? value : option)) }
+          : q,
+      ),
+    );
+  }
+
+  async function submit(e) {
+    e.preventDefault();
+    await mutate("/api/exams", {
+      ...form,
+      kkm: Number(form.kkm) || 75,
+      teacherId: user.id,
+      teacherName: user.name,
+      questions: questions.map((q, i) => ({ ...q, id: `q${Date.now()}${i}` })),
+    });
+    setForm({ title: "", subject: user.subject || "", duration: 45, kkm: 75 });
+    setQuestions([{ text: "", options: ["", "", "", ""], answer: "" }]);
+  }
+
+  return (
+    <section className="panel">
+      <div className="panel-header">
+        <h3>Susun ujian baru</h3>
+        <small>Tambahkan soal satu per satu</small>
+      </div>
+      <form onSubmit={submit}>
+        <div className="form-grid">
+          <Field label="JUDUL UJIAN" value={form.title} onChange={(e) => setForm({ ...form, title: e.target.value })} required />
+          <Field label="MATA PELAJARAN" value={form.subject} onChange={(e) => setForm({ ...form, subject: e.target.value })} required />
+          <Field label="DURASI (MENIT)" type="number" value={form.duration} onChange={(e) => setForm({ ...form, duration: Number(e.target.value) })} />
+          <Field label="KKM UJIAN" type="number" min="0" max="100" value={form.kkm} onChange={(e) => setForm({ ...form, kkm: Number(e.target.value) || 0 })} />
+        </div>
+
+        {questions.map((question, index) => (
+          <div className="question" key={index}>
+            <strong>SOAL {index + 1}</strong>
+            <div className="field">
+              <label>PERTANYAAN</label>
+              <textarea rows="2" value={question.text} onChange={(e) => updateQuestion(index, "text", e.target.value)} required />
+            </div>
+            <div className="form-grid">
+              {question.options.map((option, optionIndex) => (
+                <Field
+                  key={optionIndex}
+                  label={`PILIHAN ${String.fromCharCode(65 + optionIndex)}`}
+                  value={option}
+                  onChange={(e) => updateOption(index, optionIndex, e.target.value)}
+                  required
+                />
+              ))}
+            </div>
+            <div className="form-grid">
+              <div className="field">
+                <label>JAWABAN BENAR</label>
+                <select value={question.answer} onChange={(e) => updateQuestion(index, "answer", e.target.value)} required>
+                  <option value="">Pilih jawaban benar</option>
+                  {question.options.map((option, optionIndex) => (
+                    <option key={optionIndex} value={option}>
+                      {String.fromCharCode(65 + optionIndex)}. {option || "Jawaban belum diisi"}
+                    </option>
+                  ))}
+                </select>
+              </div>
+            </div>
+          </div>
+        ))}
+
+        <button type="button" className="secondary" onClick={() => setQuestions([...questions, { text: "", options: ["", "", "", ""], answer: "" }])}>+ Tambah soal</button>
+        <button className="primary" type="submit">Terbitkan ujian</button>
+      </form>
+    </section>
+  );
+}
+
+function UserManager({ db, mutate }) { const [form, setForm] = useState({ name: "", username: "", password: "123456", role: "siswa", className: "", major: "", subject: "" }); return <div className="section-grid"><section className="panel"><div className="panel-header"><h3>Tambah pengguna</h3></div><form onSubmit={async (e) => { e.preventDefault(); const payload = { ...form, subject: form.role === "guru" ? form.subject || form.major || "" : form.subject || "", major: form.major || "", className: form.className || "" }; await mutate("/api/users", payload); setForm({ name: "", username: "", password: "123456", role: "siswa", className: "", major: "", subject: "" }); }}><Field label="NAMA LENGKAP" value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} required /><Field label="USERNAME" value={form.username} onChange={(e) => setForm({ ...form, username: e.target.value })} required /><Field label="PASSWORD" value={form.password} onChange={(e) => setForm({ ...form, password: e.target.value })} required /><div className="field"><label>ROLE</label><select value={form.role} onChange={(e) => setForm({ ...form, role: e.target.value })}><option value="siswa">Siswa</option><option value="guru">Guru</option></select></div><Field label="KELAS" value={form.className} onChange={(e) => setForm({ ...form, className: e.target.value })} placeholder={form.role === "guru" ? "Contoh: XI RPL" : "Contoh: XI-A"} /><Field label="JURUSAN" value={form.major} onChange={(e) => setForm({ ...form, major: e.target.value })} placeholder="Contoh: RPL / TKJ / IPS / IPA" />{form.role === "guru" && <Field label="MATA PELAJARAN" value={form.subject} onChange={(e) => setForm({ ...form, subject: e.target.value })} placeholder="Contoh: Matematika" />}<button className="primary">Tambah pengguna</button></form></section><section className="panel"><div className="panel-header"><h3>Daftar pengguna</h3><small>{db.users.length} akun</small></div><div className="table-wrap"><table><thead><tr><th>Nama</th><th>Role</th><th>Kelas / Jurusan</th><th>Aksi</th></tr></thead><tbody>{db.users.map((item) => <tr key={item.id}><td>{item.name}<br /><small>{item.username}</small></td><td>{roleLabels[item.role]}</td><td>{item.className || "-"}<br /><small>{item.major || item.subject || "Belum diatur"}</small></td><td>{["siswa", "guru"].includes(item.role) && <button className="danger" onClick={() => mutate(`/api/users?id=${item.id}`, null, "DELETE")}>Hapus</button>}</td></tr>)}</tbody></table></div></section></div>; }
+
+function Statistics({ db, user }) { const teachers = db.users.filter((item) => item.role === "guru"); const students = db.users.filter((item) => item.role === "siswa"); const isLeadership = ["kepsek", "kurikulum"].includes(user?.role); const teacherTaskCount = (teacherId) => db.tasks.filter((task) => task.teacherId === teacherId).length; const teacherExamCount = (teacherId) => db.exams.filter((exam) => exam.teacherId === teacherId).length; const studentSubmissionCount = (studentId) => db.submissions.filter((item) => item.userId === studentId).length; const totalTasks = db.tasks.length; const totalExams = db.exams.length; const totalSubmissions = db.submissions.length; return <><div className="stats"><Stat value={students.length} label="Siswa aktif" /><Stat value={teachers.length} label="Guru aktif" /><Stat value={totalTasks} label="Tugas dibuat" /><Stat value={totalExams} label="Ujian dibuat" /><Stat value={totalSubmissions} label="Total pengumpulan" /><Stat value={`${Math.round((totalSubmissions / Math.max(students.length, 1)) * 10) / 10}`} label="Rata-rata aktivitas / siswa" /></div><div className="section-grid"><section className="panel"><div className="panel-header"><h3>Aktivitas guru</h3></div>{teachers.map((teacher) => <Activity key={teacher.id} title={teacher.name} meta={`${teacherTaskCount(teacher.id)} tugas · ${teacherExamCount(teacher.id)} ujian · ${teacher.subject || teacher.major || "Guru"}`} tag={teacher.className || "Umum"} />)}</section><section className="panel"><div className="panel-header"><h3>Distribusi siswa</h3></div>{[...new Set(students.map((student) => `${student.className || "Belum diatur"} · ${student.major || "Umum"}`))].map((label) => <Activity key={label} title={label} meta={`${students.filter((student) => `${student.className || "Belum diatur"} · ${student.major || "Umum"}` === label).length} siswa terdaftar`} tag="Kelas & jurusan" />)}</section>{isLeadership && <section className="panel"><div className="panel-header"><h3>Ringkasan lengkap guru & siswa</h3></div>{teachers.map((teacher) => <Activity key={`teacher-${teacher.id}`} title={teacher.name} meta={`${teacher.subject || teacher.major || "Guru"} · ${teacher.className || "Umum"} · ${teacherTaskCount(teacher.id)} tugas · ${teacherExamCount(teacher.id)} ujian`} tag="Guru" />)}{students.map((student) => <Activity key={`student-${student.id}`} title={student.name} meta={`${student.className || "Belum diatur"} · ${student.major || "Umum"} · ${studentSubmissionCount(student.id)} aktivitas`} tag="Siswa" />)}</section>}</div></>; }
